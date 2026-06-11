@@ -1,0 +1,11 @@
+{
+  "name": "cleanup-stale-environments",
+  "version": "1.0.0",
+  "description": "Lambda function that auto-destroys ephemeral environments after 24h of inactivity",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-ecs": "^3.500.0",
+    "@aws-sdk/client-cloudwatch": "^3.500.0",
+    "@aws-sdk/client-s3": "^3.500.0"
+  }
+}

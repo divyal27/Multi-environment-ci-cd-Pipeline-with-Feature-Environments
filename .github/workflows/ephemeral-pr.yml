@@ -1,0 +1,291 @@
+name: Ephemeral PR Environment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  deployments: write
+
+env:
+  AWS_REGION: us-east-1
+  TF_STATE_BUCKET: ephemeral-env-tfstate
+  TF_LOCK_TABLE: ephemeral-env-tfstate-lock
+  DNS_ZONE: app.dev
+  APP_IMAGE: ${{ secrets.ECR_REPOSITORY }}:pr-${{ github.event.number }}
+
+jobs:
+  # -------------------------------------------------------------------
+  # Build & Push (always runs on open/sync)
+  # -------------------------------------------------------------------
+  build:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build-push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build-push
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY:${{ env.APP_IMAGE }} .
+          docker push $ECR_REGISTRY:${{ env.APP_IMAGE }}
+          echo "image=$ECR_REGISTRY:${{ env.APP_IMAGE }}" >> $GITHUB_OUTPUT
+
+  # -------------------------------------------------------------------
+  # Provision (open/sync/reopen)
+  # -------------------------------------------------------------------
+  provision:
+    if: github.event.action != 'closed'
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: ephemeral-pr-${{ github.event.number }}
+      url: https://pr-${{ github.event.number }}.${{ env.DNS_ZONE }}
+    outputs:
+      env_url: ${{ steps.apply.outputs.env_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: infrastructure
+        run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: Select or Create Workspace
+        working-directory: infrastructure
+        run: |
+          terraform workspace select pr-${{ github.event.number }} 2>/dev/null \
+            || terraform workspace new pr-${{ github.event.number }}
+
+      - name: Terraform Apply
+        id: apply
+        working-directory: infrastructure
+        env:
+          TF_VAR_app_image: ${{ needs.build.outputs.image }}
+          TF_VAR_dns_zone_name: ${{ env.DNS_ZONE }}
+          TF_VAR_pr_number: ${{ github.event.number }}
+        run: |
+          terraform apply -auto-approve
+          echo "env_url=$(terraform output -raw environment_url)" >> $GITHUB_OUTPUT
+
+      - name: Tag environment as active
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/deployments \
+            -d '{
+              "ref": "${{ github.head_ref }}",
+              "environment": "ephemeral-pr-${{ github.event.number }}",
+              "transient_environment": true,
+              "auto_merge": false,
+              "required_contexts": []
+            }'
+
+  # -------------------------------------------------------------------
+  # Smoke Tests (after provision)
+  # -------------------------------------------------------------------
+  smoke-tests:
+    if: github.event.action != 'closed'
+    needs: [provision]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: tests/smoke
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: tests/smoke
+        run: npx playwright install chromium
+
+      - name: Run smoke tests
+        id: tests
+        working-directory: tests/smoke
+        env:
+          BASE_URL: https://pr-${{ github.event.number }}.${{ env.DNS_ZONE }}
+        continue-on-error: true
+        run: |
+          npx playwright test --reporter=json 2>&1 | tee test-output.json
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      - name: Post results as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('tests/smoke/test-output.json', 'utf8'));
+            const suites = report.suites || [];
+            let passed = 0, failed = 0, skipped = 0;
+            for (const s of suites) {
+              for (const spec of s.specs || []) {
+                if (spec.ok) passed++; else if (spec.skipped) skipped++; else failed++;
+              }
+            }
+            const badge = failed > 0 ? '❌' : '✅';
+            const body = `## Ephemeral Environment Report
+            | Aspect | Result |
+            |---|---|
+            | **Environment** | https://pr-${{ github.event.number }}.${{ env.DNS_ZONE }} |
+            | **Smoke Tests** | ${badge} **${failed} failed**, ${passed} passed, ${skipped} skipped |
+            | **Action** | ${{ github.event.action }} |
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Fail if tests failed
+        if: steps.tests.outputs.exit_code != '0'
+        run: exit 1
+
+  # -------------------------------------------------------------------
+  # Destroy (on close)
+  # -------------------------------------------------------------------
+  destroy:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: infrastructure
+        run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: Select Workspace
+        working-directory: infrastructure
+        run: terraform workspace select pr-${{ github.event.number }}
+
+      - name: Terraform Destroy
+        working-directory: infrastructure
+        env:
+          TF_VAR_app_image: "placeholder"
+          TF_VAR_dns_zone_name: ${{ env.DNS_ZONE }}
+          TF_VAR_pr_number: ${{ github.event.number }}
+        run: terraform destroy -auto-approve
+
+      - name: Delete Workspace
+        working-directory: infrastructure
+        run: terraform workspace select default && terraform workspace delete pr-${{ github.event.number }}
+
+      - name: Delete deployment environment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'success',
+              context: 'ephemeral-env/pr-${{ github.event.number }}',
+              description: 'Environment destroyed'
+            });
+
+  # -------------------------------------------------------------------
+  # Drift detection (scheduled via cron — separate workflow)
+  # -------------------------------------------------------------------
+  drift-detection:
+    if: github.event.action != 'closed'
+    needs: [provision]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: infrastructure
+        run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: Select Workspace
+        working-directory: infrastructure
+        run: terraform workspace select pr-${{ github.event.number }}
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: infrastructure
+        env:
+          TF_VAR_app_image: ${{ needs.build.outputs.image }}
+          TF_VAR_dns_zone_name: ${{ env.DNS_ZONE }}
+          TF_VAR_pr_number: ${{ github.event.number }}
+        continue-on-error: true
+        run: terraform plan -no-color -out=plan.tfplan 2>&1 | tee plan-output.txt
+
+      - name: Post drift comment if changes detected
+        if: steps.plan.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('infrastructure/plan-output.txt', 'utf8');
+            if (plan.includes('No changes')) {
+              console.log('No drift detected');
+              return;
+            }
+            const body = `## ⚠️ Drift Detected
+            Terraform plan shows infrastructure changes not reflected in code:
+            \`\`\`
+            ${plan.slice(0, 3000)}
+            \`\`\`
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });

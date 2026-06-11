@@ -1,0 +1,84 @@
+name: Scheduled Drift Detection
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: us-east-1
+  DNS_ZONE: app.dev
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: ${{ fromJson(needs.list-workspaces.outputs.workspaces) }}
+    needs: [list-workspaces]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: infrastructure
+        run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: infrastructure
+        env:
+          TF_VAR_dns_zone_name: ${{ env.DNS_ZONE }}
+          TF_VAR_pr_number: ${{ matrix.workspace }}
+        run: |
+          terraform workspace select ${{ matrix.workspace }}
+          terraform plan -no-color 2>&1 | tee plan.txt
+
+      - name: Notify if drift found
+        if: failure() || steps.plan.outputs.changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: parseInt('${{ matrix.workspace }}'.replace('pr-','')),
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ⚠️ Drift Detected in ${{ matrix.workspace }}
+              Infrastructure has drifted from Terraform state. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            });
+
+  list-workspaces:
+    runs-on: ubuntu-latest
+    outputs:
+      workspaces: ${{ steps.list.outputs.workspaces }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+      - name: List workspaces
+        id: list
+        working-directory: infrastructure
+        run: |
+          terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+          echo "workspaces=$(terraform workspace list -json | jq -c '[.[] | select(. != "default")]')" >> $GITHUB_OUTPUT

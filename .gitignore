@@ -1,0 +1,34 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Terraform
+infrastructure/.terraform/
+infrastructure/*.tfplan
+infrastructure/*.tfstate
+infrastructure/*.tfstate.backup
+infrastructure/terraform.tfvars
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Lambda
+lambda/**/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
+
+# Test output
+test-output.json
+test-results/
+
+# Aider
+.aider*

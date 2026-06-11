@@ -1,0 +1,7 @@
+aws_region         = "us-east-1"
+base_vpc_cidr      = "10.0.0.0/16"
+container_port     = 8080
+app_image          = "your-ecr-repo/app:latest"
+rds_instance_class = "db.t3.micro"
+dns_zone_name      = "app.dev"
+pr_number          = "42"
